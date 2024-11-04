@@ -6,6 +6,23 @@ import numpy as np
 import json
 from typing import Optional, Tuple, Union, List, NamedTuple
 
+import os
+import json
+import tarfile
+import shutil
+from pathlib import Path
+from typing import Union
+from tqdm import tqdm
+from huggingface_hub import HfApi, upload_file, hf_hub_download
+
+import os
+import json
+import tarfile
+import shutil
+from pathlib import Path
+from typing import Union
+from tqdm import tqdm
+from huggingface_hub import HfApi, upload_file, hf_hub_download
 
 
 #@title Function to get a batch of window data
@@ -209,14 +226,14 @@ def save_window_data(
 
             # Save window averages
             avg_grp = f.create_group('window_averages')
-            avg_grp.create_dataset('indices', data=avg.indices().numpy(), compression=compression)
-            avg_grp.create_dataset('values', data=avg.values().float().numpy(), compression=compression)
+            avg_grp.create_dataset('indices', data=avg.indices().detach().numpy(), compression=compression)
+            avg_grp.create_dataset('values', data=avg.values().float().detach().numpy(), compression=compression)
             avg_grp.attrs['shape'] = avg.size()
 
             # Save activation probabilities
             p_act_grp = f.create_group('window_p_active')
-            p_act_grp.create_dataset('indices', data=p_act.indices().numpy(), compression=compression)
-            p_act_grp.create_dataset('values', data=p_act.values().float().numpy(), compression=compression)
+            p_act_grp.create_dataset('indices', data=p_act.indices().detach().numpy(), compression=compression)
+            p_act_grp.create_dataset('values', data=p_act.values().float().detach().numpy(), compression=compression)
             p_act_grp.attrs['shape'] = p_act.size()
 
             if return_feature_acts and batch_result[2] is not None:
@@ -330,7 +347,15 @@ def load_window_data(metadata_file: Union[str, Path]) -> dict:
 
 
 
-#@title Upload to google drive
+import os
+import json
+import tarfile
+import shutil
+from pathlib import Path
+from typing import Union
+from tqdm import tqdm
+from huggingface_hub import HfApi, upload_file, hf_hub_download
+
 def safe_cleanup(path: Path):
     """Safely remove a file or directory and its contents."""
     path = Path(path)
@@ -344,32 +369,39 @@ def safe_cleanup(path: Path):
                 safe_cleanup(item)
         path.rmdir()
 
-def upload_chunks_to_drive(
+def upload_chunks_to_hub(
     metadata_file: Union[str, Path],
-    drive_folder: str = "window_data",
+    repo_id: str,
+    file_prefix: str = "",
     chunk_size_mb: int = 500,
-    cleanup: bool = True
+    cleanup: bool = True,
+    token: str = None,
+    repo_type: str = "dataset"
 ) -> dict:
     """
-    Uploads chunked window data to Google Drive with compression.
+    Uploads chunked window data to Hugging Face Hub with compression.
 
     Args:
         metadata_file: Path to the metadata JSON file
-        drive_folder: Folder name in Google Drive to store the files
+        repo_id: Hugging Face repository ID (e.g., 'username/repo-name')
+        file_prefix: Prefix to add to all uploaded files
         chunk_size_mb: Target size in MB for each compressed archive
         cleanup: Whether to remove local compressed files after upload
+        token: Hugging Face API token
+        repo_type: Repository type ("dataset" or "model")
 
     Returns:
-        dict: Updated metadata with Google Drive paths
+        dict: Updated metadata with Hugging Face paths
     """
     try:
-        # Mount Google Drive
-        drive.mount('/content/drive')
-        drive_root = Path('/content/drive/MyDrive')
-
-        # Create drive folder if it doesn't exist
-        drive_path = drive_root / drive_folder
-        drive_path.mkdir(parents=True, exist_ok=True)
+        # Initialize Hugging Face API
+        api = HfApi(token=token)
+        
+        # Ensure the repository exists
+        try:
+            api.create_repo(repo_id=repo_id, repo_type=repo_type, exist_ok=True)
+        except Exception as e:
+            print(f"Note: Repository already exists or couldn't be created: {e}")
 
         # Load metadata
         metadata_file = Path(metadata_file)
@@ -377,7 +409,7 @@ def upload_chunks_to_drive(
             metadata = json.load(f)
 
         # Create a temporary directory for compressed files
-        temp_dir = Path('/content/temp_compressed')
+        temp_dir = Path('./temp_compressed')
         temp_dir.mkdir(exist_ok=True)
 
         # Helper function to create compressed archives
@@ -389,6 +421,12 @@ def upload_chunks_to_drive(
         # Helper function to estimate file size in MB
         def get_size_mb(file_path):
             return os.path.getsize(file_path) / (1024 * 1024)
+
+        # Helper function to create hub path with prefix
+        def get_hub_path(filename):
+            if file_prefix:
+                return f"{file_prefix}/{filename}"
+            return filename
 
         # Group files into chunks based on size
         def group_files_by_size(file_list, target_size_mb):
@@ -412,7 +450,7 @@ def upload_chunks_to_drive(
             return groups
 
         # Process and upload files
-        drive_paths = {
+        hub_paths = {
             'mapping_file': '',
             'batch_archives': [],
             'token_archives': []
@@ -422,9 +460,14 @@ def upload_chunks_to_drive(
         print("Uploading mapping file...")
         mapping_archive = temp_dir / 'mapping.tar.gz'
         create_tar_archive([metadata['mapping_file']], mapping_archive)
-        drive_mapping_path = drive_path / 'mapping.tar.gz'
-        shutil.copy(mapping_archive, drive_mapping_path)
-        drive_paths['mapping_file'] = str(drive_mapping_path)
+        hub_mapping_path = get_hub_path('mapping.tar.gz')
+        api.upload_file(
+            path_or_fileobj=str(mapping_archive),
+            path_in_repo=hub_mapping_path,
+            repo_id=repo_id,
+            repo_type=repo_type
+        )
+        hub_paths['mapping_file'] = hub_mapping_path
 
         if cleanup:
             safe_cleanup(mapping_archive)
@@ -438,9 +481,14 @@ def upload_chunks_to_drive(
         for i, batch_group in enumerate(tqdm(batch_groups)):
             archive_path = temp_dir / f'batch_group_{i}.tar.gz'
             create_tar_archive(batch_group, archive_path)
-            drive_archive_path = drive_path / f'batch_group_{i}.tar.gz'
-            shutil.copy(archive_path, drive_archive_path)
-            drive_paths['batch_archives'].append(str(drive_archive_path))
+            hub_archive_path = get_hub_path(f'batch_group_{i}.tar.gz')
+            api.upload_file(
+                path_or_fileobj=str(archive_path),
+                path_in_repo=hub_archive_path,
+                repo_id=repo_id,
+                repo_type=repo_type
+            )
+            hub_paths['batch_archives'].append(hub_archive_path)
 
             if cleanup:
                 safe_cleanup(archive_path)
@@ -450,25 +498,43 @@ def upload_chunks_to_drive(
         for i, token_group in enumerate(tqdm(token_groups)):
             archive_path = temp_dir / f'token_group_{i}.tar.gz'
             create_tar_archive(token_group, archive_path)
-            drive_archive_path = drive_path / f'token_group_{i}.tar.gz'
-            shutil.copy(archive_path, drive_archive_path)
-            drive_paths['token_archives'].append(str(drive_archive_path))
+            hub_archive_path = get_hub_path(f'token_group_{i}.tar.gz')
+            api.upload_file(
+                path_or_fileobj=str(archive_path),
+                path_in_repo=hub_archive_path,
+                repo_id=repo_id,
+                repo_type=repo_type
+            )
+            hub_paths['token_archives'].append(hub_archive_path)
 
             if cleanup:
                 safe_cleanup(archive_path)
 
-        # Create new metadata with drive paths
-        drive_metadata = {
+        # Create new metadata with hub paths
+        hub_metadata = {
             'original_metadata': metadata,
-            'drive_paths': drive_paths
+            'hub_paths': hub_paths,
+            'repo_id': repo_id,
+            'repo_type': repo_type,
+            'file_prefix': file_prefix
         }
 
-        # Save drive metadata
-        drive_metadata_path = drive_path / 'drive_metadata.json'
-        with open(drive_metadata_path, 'w') as f:
-            json.dump(drive_metadata, f, indent=2)
+        # Save and upload hub metadata
+        hub_metadata_path = temp_dir / 'hub_metadata.json'
+        with open(hub_metadata_path, 'w') as f:
+            json.dump(hub_metadata, f, indent=2)
+        
+        api.upload_file(
+            path_or_fileobj=str(hub_metadata_path),
+            path_in_repo=get_hub_path('hub_metadata.json'),
+            repo_id=repo_id,
+            repo_type=repo_type
+        )
 
-        return drive_metadata
+        if cleanup:
+            safe_cleanup(hub_metadata_path)
+
+        return hub_metadata
 
     finally:
         # Always attempt cleanup of temp directory at the end
@@ -477,23 +543,26 @@ def upload_chunks_to_drive(
                 safe_cleanup(temp_dir)
             except Exception as e:
                 print(f"Warning: Could not completely clean up temporary directory: {e}")
-                print("You may need to manually remove /content/temp_compressed")
+                print("You may need to manually remove ./temp_compressed")
 
-                
-
-#@title Download from drive
-def download_chunks_from_drive(
-    drive_metadata_path: Union[str, Path],
+def download_chunks_from_hub(
+    repo_id: str,
     local_dir: Union[str, Path],
-    cleanup: bool = True
+    file_prefix: str = "",
+    cleanup: bool = True,
+    token: str = None,
+    repo_type: str = "dataset"
 ) -> dict:
     """
-    Downloads and extracts chunked window data from Google Drive.
+    Downloads and extracts chunked window data from Hugging Face Hub.
 
     Args:
-        drive_metadata_path: Path to the drive metadata JSON file
+        repo_id: Hugging Face repository ID (e.g., 'username/repo-name')
         local_dir: Local directory to extract files to
+        file_prefix: Prefix used when files were uploaded
         cleanup: Whether to remove compressed archives after extraction
+        token: Hugging Face API token
+        repo_type: Repository type ("dataset" or "model")
 
     Returns:
         dict: Original metadata with local file paths
@@ -501,29 +570,46 @@ def download_chunks_from_drive(
     local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load drive metadata
-    with open(drive_metadata_path, 'r') as f:
-        drive_metadata = json.load(f)
-
     # Create temp directory for archives
     temp_dir = local_dir / 'temp_archives'
     temp_dir.mkdir(exist_ok=True)
 
-    # Initialize lists to track extracted files
-    extracted_files = {
-        'mapping_file': '',
-        'batch_files': [],
-        'token_files': []
-    }
+    # Helper function to get hub path with prefix
+    def get_hub_path(filename):
+        if file_prefix:
+            return f"{file_prefix}/{filename}"
+        return filename
 
     try:
+        # Download and load hub metadata
+        hub_metadata_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=get_hub_path('hub_metadata.json'),
+            repo_type=repo_type,
+            token=token
+        )
+        with open(hub_metadata_path, 'r') as f:
+            hub_metadata = json.load(f)
+
+        # Initialize lists to track extracted files
+        extracted_files = {
+            'mapping_file': '',
+            'batch_files': [],
+            'token_files': []
+        }
+
         # Download and extract mapping file
         print("Downloading mapping file...")
         mapping_archive = temp_dir / 'mapping.tar.gz'
-        shutil.copy(drive_metadata['drive_paths']['mapping_file'], mapping_archive)
+        downloaded_mapping = hf_hub_download(
+            repo_id=repo_id,
+            filename=hub_metadata['hub_paths']['mapping_file'],
+            repo_type=repo_type,
+            token=token
+        )
+        shutil.copy(downloaded_mapping, mapping_archive)
         with tarfile.open(mapping_archive, 'r:gz') as tar:
             tar.extractall(local_dir)
-            # Get the name of the extracted mapping file
             for member in tar.getmembers():
                 if member.isfile():
                     extracted_files['mapping_file'] = str(local_dir / member.name)
@@ -533,12 +619,17 @@ def download_chunks_from_drive(
 
         # Download and extract batch files
         print("Downloading batch files...")
-        for archive_path in tqdm(drive_metadata['drive_paths']['batch_archives']):
+        for archive_path in tqdm(hub_metadata['hub_paths']['batch_archives']):
             local_archive = temp_dir / os.path.basename(archive_path)
-            shutil.copy(archive_path, local_archive)
+            downloaded_archive = hf_hub_download(
+                repo_id=repo_id,
+                filename=archive_path,
+                repo_type=repo_type,
+                token=token
+            )
+            shutil.copy(downloaded_archive, local_archive)
             with tarfile.open(local_archive, 'r:gz') as tar:
                 tar.extractall(local_dir)
-                # Track extracted batch files
                 for member in tar.getmembers():
                     if member.isfile():
                         extracted_files['batch_files'].append(str(local_dir / member.name))
@@ -548,12 +639,17 @@ def download_chunks_from_drive(
 
         # Download and extract token files
         print("Downloading token files...")
-        for archive_path in tqdm(drive_metadata['drive_paths']['token_archives']):
+        for archive_path in tqdm(hub_metadata['hub_paths']['token_archives']):
             local_archive = temp_dir / os.path.basename(archive_path)
-            shutil.copy(archive_path, local_archive)
+            downloaded_archive = hf_hub_download(
+                repo_id=repo_id,
+                filename=archive_path,
+                repo_type=repo_type,
+                token=token
+            )
+            shutil.copy(downloaded_archive, local_archive)
             with tarfile.open(local_archive, 'r:gz') as tar:
                 tar.extractall(local_dir)
-                # Track extracted token files
                 for member in tar.getmembers():
                     if member.isfile():
                         extracted_files['token_files'].append(str(local_dir / member.name))
