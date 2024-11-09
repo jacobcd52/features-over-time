@@ -270,17 +270,32 @@ def save_window_data(
 
 
 
-
-#@title function to move data from disk to CPU
-def load_window_data(metadata_file: Union[str, Path]) -> dict:
+def load_window_data(metadata_file: Union[str, Path], 
+                     chunk_indices: Optional[List[int]] = None,
+                     print_shapes=False) -> dict:
     """
     Helper function to load the chunked data back into memory when needed.
-    Returns a dictionary with the combined data.
+    Returns a dictionary with the combined data, with all tensors concatenated across chunks.
+    
+    Args:
+        metadata_file: Path to the metadata JSON file
+        chunk_indices: Optional list of indices specifying which chunks to load.
+                      If None, loads all chunks.
+    
+    Returns:
+        dict: Dictionary containing the concatenated data from specified chunks
     """
     metadata_file = Path(metadata_file)
+    base_dir = metadata_file.parent
+    
     with open(metadata_file, 'r') as f:
         metadata = json.load(f)
-
+    
+    # Adjust paths to be relative to metadata file location
+    metadata['mapping_file'] = str(base_dir / Path(metadata['mapping_file']).name)
+    metadata['batch_files'] = [str(base_dir / Path(f).name) for f in metadata['batch_files']]
+    metadata['token_files'] = [str(base_dir / Path(f).name) for f in metadata['token_files']]
+        
     # Load mapping information
     with h5py.File(metadata['mapping_file'], 'r') as f:
         window_info = {
@@ -288,20 +303,32 @@ def load_window_data(metadata_file: Union[str, Path]) -> dict:
             'window_ends': torch.from_numpy(f['window_ends'][:]),
             'attrs': dict(f.attrs)
         }
-
+        
+    # Get the chunk indices to load
+    total_chunks = len(metadata['batch_files'])
+    if chunk_indices is None:
+        chunk_indices = list(range(total_chunks))
+    else:
+        # Validate indices
+        if not all(0 <= idx < total_chunks for idx in chunk_indices):
+            raise ValueError(f"Chunk indices must be between 0 and {total_chunks-1}")
+            
     # Initialize lists to store batch data
     all_tokens = []
     all_window_averages = []
     all_window_p_active = []
     all_feature_acts = []
     all_generated_tokens = []
-
-    # Load each batch
-    for batch_file, token_file in zip(metadata['batch_files'], metadata['token_files']):
+    
+    # Load only specified batches
+    for idx in chunk_indices:
+        batch_file = metadata['batch_files'][idx]
+        token_file = metadata['token_files'][idx]
+        
         # Load tokens
         with h5py.File(token_file, 'r') as f:
             all_tokens.append(torch.from_numpy(f['tokens'][:]))
-
+            
         # Load batch data
         with h5py.File(batch_file, 'r') as f:
             # Load window averages
@@ -311,7 +338,7 @@ def load_window_data(metadata_file: Union[str, Path]) -> dict:
             shape = tuple(avg_grp.attrs['shape'])
             avg = torch.sparse_coo_tensor(indices, values, shape)
             all_window_averages.append(avg)
-
+            
             # Load activation probabilities
             p_act_grp = f['window_p_active']
             indices = torch.from_numpy(p_act_grp['indices'][:])
@@ -319,7 +346,7 @@ def load_window_data(metadata_file: Union[str, Path]) -> dict:
             shape = tuple(p_act_grp.attrs['shape'])
             p_act = torch.sparse_coo_tensor(indices, values, shape)
             all_window_p_active.append(p_act)
-
+            
             # Load feature activations if present
             if 'feature_acts' in f:
                 feat_grp = f['feature_acts']
@@ -328,20 +355,52 @@ def load_window_data(metadata_file: Union[str, Path]) -> dict:
                 shape = tuple(feat_grp.attrs['shape'])
                 feat_acts = torch.sparse_coo_tensor(indices, values, shape)
                 all_feature_acts.append(feat_acts)
-
+                
             # Load generated tokens if present
             if 'tokens_plus_generation' in f:
                 all_generated_tokens.append(
                     torch.from_numpy(f['tokens_plus_generation'][:])
                 )
+    
+    # Helper function to safely concatenate sparse tensors
+    def concatenate_sparse_tensors(tensor_list):
+        if not tensor_list:
+            return None
+        # Convert sparse tensors to dense before concatenation
+        # Note: This might be memory intensive for very large tensors
+        return torch.cat([t.to_dense() for t in tensor_list], dim=0)
+
+    tokens = torch.cat(all_tokens, dim=0) if all_tokens else None
+    window_averages = concatenate_sparse_tensors(all_window_averages)
+    window_p_active = concatenate_sparse_tensors(all_window_p_active)
+    feature_acts = concatenate_sparse_tensors(all_feature_acts)
+    generated_tokens = torch.cat(all_generated_tokens, dim=0) if all_generated_tokens else None
+
+    if print_shapes:
+        print('tokens shape:', tuple(tokens.shape))
+        print('window_p_active shape:', tuple(window_p_active.shape))
+        print('window_averages shape:', tuple(window_averages.shape))
+        if tokens is not None:
+            print('tokens shape:', tuple(tokens.shape))
+        else:
+            print('tokens is None (tokens were not saved)')
+        if feature_acts is not None:
+            print('feature_acts shape:', tuple(feature_acts.shape))
+        else:
+            print('feature_acts is None (per-token feature activations were not saved)')
+        if generated_tokens is not None:
+            print('generated_tokens shape:', tuple(generated_tokens.shape))
+        else:
+            print('generated_tokens is None (no tokens were generated by the model)')
+        print('window_info keys: ', list(window_info.keys()))
 
     return {
         'window_info': window_info,
-        'tokens': torch.cat(all_tokens, dim=0),
-        'window_averages': all_window_averages,
-        'window_p_active': all_window_p_active,
-        'feature_acts': all_feature_acts if all_feature_acts else None,
-        'generated_tokens': all_generated_tokens if all_generated_tokens else None
+        'tokens': all_tokens,
+        'window_averages': window_averages,
+        'window_p_active': window_p_active,
+        'feature_acts': feature_acts,
+        'generated_tokens': generated_tokens
     }
 
 
